@@ -22,10 +22,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Fix icon (ensure 256x256 ico)
-        run: magick assets/logo.png -resize 256x256 assets/logo.ico
-        shell: pwsh
-
       - name: Build Windows (NSIS + Portable)
         run: npm run build:win
 
