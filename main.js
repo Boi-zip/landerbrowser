@@ -1532,6 +1532,10 @@ const DEF_SETTINGS = {
   aiTemperature: 0.5,
   aiMaxTokens: 400,
   aiCustomPrompt: '',
+  downloadPath: '',          // '' = use system default Downloads folder
+  askDownloadPath: false,
+  autoOpenDownloads: false,
+  autoOpenFile: false,
 };
 
 // ── App state (populated in initStorage after app ready) ──────────────────────
@@ -3788,6 +3792,13 @@ function setupSession(ses) {
   });
 
   ses.on('will-download', (_, item) => {
+    // Set custom download folder if configured
+    if (settings.downloadPath) {
+      try {
+        const saveTo = path.join(settings.downloadPath, item.getFilename());
+        item.setSavePath(saveTo);
+      } catch {}
+    }
     const entry = {
       id: Date.now(), filename: item.getFilename(),
       path: '', size: item.getTotalBytes(), received: 0, state: 'progressing',
@@ -5916,6 +5927,16 @@ ipcMain.on('downloads:clear', () => {
   downloads = downloads.filter(d => d.state === 'progressing');
   save(F.downloads, []);
   send('downloads:update', downloads);
+});
+
+ipcMain.handle('downloads:pick-dir', async () => {
+  const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
+  if (r.canceled) return null;
+  const chosen = r.filePaths[0];
+  settings.downloadPath = chosen;
+  save(F.settings, settings);
+  send('settings:set', settings);
+  return chosen;
 });
 // ── Limiter Tool IPC ──────────────────────────────────────────────────────────
 ipcMain.handle('limiter:totalmem', () => require('os').totalmem());

@@ -13794,7 +13794,10 @@ const setDlAutoOpenFile = $('set-dl-auto-open-file');
 if (setDlAutoOpenFile) setDlAutoOpenFile.addEventListener('change',function(){ ipcRenderer.send('settings:set',{autoOpenFile:this.checked}); });
 
 const setDlPathBtn = $('set-dl-path-btn');
-if (setDlPathBtn) setDlPathBtn.addEventListener('click', () => ipcRenderer.send('ytdlp:pick-outdir'));
+if (setDlPathBtn) setDlPathBtn.addEventListener('click', async () => {
+  const chosen = await ipcRenderer.invoke('downloads:pick-dir');
+  if (chosen && setDlPathLabel) setDlPathLabel.textContent = chosen;
+});
 
 const selPrefLangSettings = $('set-preferred-language');
 if (selPrefLangSettings) selPrefLangSettings.addEventListener('change', function(){
