@@ -1897,10 +1897,13 @@ let   panelOpen    = false;
 let   panelClipX   = 0;       // >0 = BV clipped to leave room for open panel
 let   _omniParked  = false;   // true while BV is parked for the omni dropdown
 let   _panelSeq         = 0;        // increments on every panel:show:* to cancel stale async chains
+let   _mainResizeTimer  = null;     // debounce expensive BrowserView bounds updates during resize drags
 
 // ── IPC shortcut ──────────────────────────────────────────────────────────────
 let _dlPopupThrottleTimer = null;
 let _dlPopupPendingArgs   = null;
+let _poisonSignalState    = null;   // dynamic ad-network persona headers (updated via IPC)
+let _poisonHookReady      = false;  // prevents stacking multiple webRequest listeners
 
 function send(ch, ...a) {
   if (win && !win.isDestroyed()) win.webContents.send(ch, ...a);
@@ -3644,6 +3647,9 @@ function setupSession(ses) {
     h['DNT'] = '1';
     h['Sec-GPC'] = '1';
     _applyUA(h);
+    if (settings.preferredLanguage) {
+      h['Accept-Language'] = settings.preferredLanguage + ', en;q=0.9';
+    }
 
     // Strip Referer on cross-origin requests — prevents full page URLs (with
     // tokens / session IDs) leaking to third-party servers.
@@ -3832,9 +3838,40 @@ function setupSession(ses) {
   });
 }
 
+function _ensurePoisonSignalHook() {
+  if (_poisonHookReady) return;
+  try {
+    const ses = session.fromPartition('persist:main');
+    ses.webRequest.onBeforeSendHeaders(
+      {
+        urls: [
+          '*://securepubads.g.doubleclick.net/*',
+          '*://pagead2.googlesyndication.com/*',
+          '*://ads.twitter.com/*',
+          '*://connect.facebook.net/*',
+          '*://pixel.advertising.com/*',
+        ],
+      },
+      (details, cb) => {
+        const state = _poisonSignalState;
+        if (!state || !state.kw) return cb({ requestHeaders: details.requestHeaders });
+        cb({
+          requestHeaders: {
+            ...details.requestHeaders,
+            'X-Interest-Category': state.kw,
+            'X-Audience-Segment': state.ints || state.kw,
+          },
+        });
+      }
+    );
+    _poisonHookReady = true;
+  } catch {}
+}
+
 // ── App ready ─────────────────────────────────────────────────────────────────
 app.whenReady().then(() => {
   initStorage();   // app.getPath() now works
+  _ensurePoisonSignalHook();
   // Load filter lists from local cache (or download if not cached / stale).
   // Runs async in background — blocking never impacts app startup.
   _loadFilterLists(false).catch(() => {});
@@ -3904,6 +3941,7 @@ app.whenReady().then(() => {
       h['Sec-CH-UA-Bitness']           = '"64"';
       h['Sec-CH-UA-Full-Version']      = '"135.0.7049.85"';
       h['Sec-CH-UA-Full-Version-List'] = '"Not_A Brand";v="8.0.0.0", "Chromium";v="135.0.7049.85", "Google Chrome";v="135.0.7049.85"';
+      if (settings.preferredLanguage) h['Accept-Language'] = settings.preferredLanguage + ', en;q=0.9';
       cb({ requestHeaders: h });
     });
     win.show();
@@ -3999,16 +4037,21 @@ app.whenReady().then(() => {
 
   win.on('resize', () => {
     if (panelOpen) return;
-    for (const t of tabMap.values()) {
-      if (t.bv && t.url !== 'newtab' && !t.bv.webContents.isDestroyed()) {
-        try { setBounds(t.bv); } catch {}
+    if (_mainResizeTimer) clearTimeout(_mainResizeTimer);
+    _mainResizeTimer = setTimeout(() => {
+      _mainResizeTimer = null;
+      for (const t of tabMap.values()) {
+        if (t.bv && t.url !== 'newtab' && !t.bv.webContents.isDestroyed()) {
+          try { setBounds(t.bv); } catch {}
+        }
       }
-    }
+    }, 16);
   });
 
   win.on('maximize',   () => send('win:state', 'maximized'));
   win.on('unmaximize', () => send('win:state', 'normal'));
   win.on('close', (e) => {
+    if (_mainResizeTimer) { clearTimeout(_mainResizeTimer); _mainResizeTimer = null; }
     // First-time close confirmation dialog — only when there are real browsing tabs
     if (!settings.closeConfirmSkip && !settings._closingNow) {
       const hasRealTabs = [...tabMap.values()].some(t => t.url && t.url !== 'newtab');
@@ -6198,6 +6241,7 @@ function _startMemMetrics() {
   if (_memMetricsInterval) { clearInterval(_memMetricsInterval); _memMetricsInterval = null; }
   _memMetricsInterval = setInterval(() => {
     if (!win || win.isDestroyed()) return;
+    if (win.isMinimized() || !win.isVisible()) return;
     try {
       const metrics = app.getAppMetrics();
       // Build pid → workingSetSize (KB) map
@@ -6224,14 +6268,7 @@ function _startMemMetrics() {
 // ── IPC: Language ──────────────────────────────────────────────────────────────
 function applyPreferredLanguage(lang) {
   if (!lang) return;
-  try {
-    const { session } = require('electron');
-    session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['<all_urls>'] }, (details, cb) => {
-      const h = { ...details.requestHeaders };
-      h['Accept-Language'] = lang + ', en;q=0.9';
-      cb({ requestHeaders: h });
-    });
-  } catch (e) {}
+  settings.preferredLanguage = lang;
 }
 ipcMain.on('language:set', (_, lang) => {
   if (!lang) return;
@@ -6837,15 +6874,9 @@ ipcMain.on('poison:signal', (_e, { keyword, interests } = {}) => {
     const ints = (Array.isArray(interests) ? interests : []).slice(0, 8)
                    .map(s => String(s).slice(0, 30).replace(/[^\w\s-]/g, '')).join(', ');
     if (!kw) return;
-    // Store as session-level header override for ad network requests
-    // Uses non-standard headers that DSPs sometimes read, harmless to first-party sites
-    const ses = win?.webContents?.session;
-    if (!ses) return;
-    ses.webRequest.onBeforeSendHeaders({ urls: ['*://securepubads.g.doubleclick.net/*', '*://pagead2.googlesyndication.com/*', '*://ads.twitter.com/*', '*://connect.facebook.net/*', '*://pixel.advertising.com/*'] },
-      (details, cb) => {
-        cb({ requestHeaders: { ...details.requestHeaders, 'X-Interest-Category': kw, 'X-Audience-Segment': ints || kw } });
-      }
-    );
+    // Update the shared state read by a single session-level hook.
+    _poisonSignalState = { kw, ints: ints || kw };
+    _ensurePoisonSignalHook();
   } catch {}
 });
 
